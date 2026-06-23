@@ -65,30 +65,82 @@ def _run(cmd: list[str], timeout: int = 120, cwd: str | None = None) -> str:
         return f"Command not found: {e}"
 
 
+class _PermissiveLoader(yaml.SafeLoader):
+    """YAML loader that silently ignores unknown tags (e.g. !secret in ESPHome output)."""
+    pass
+
+def _unknown_constructor(loader, tag_suffix, node):
+    return loader.construct_scalar(node)
+
+_PermissiveLoader.add_multi_constructor("", _unknown_constructor)
+
+
+def _clean_esphome_output(text: str) -> str:
+    """Extract the key error from ESPHome output, stripping log noise and tracebacks.
+
+    Removes INFO/WARNING/DEBUG lines, traceback frames, and indented lines,
+    leaving only the final meaningful ERROR line(s).
+    """
+    lines = [
+        line for line in text.splitlines()
+        if not line.startswith(("INFO ", "WARNING ", "DEBUG "))
+        and not line.startswith("Traceback ")
+        and not line.strip().startswith('File "')
+        and not (line.startswith("  ") and line.strip())  # indented traceback lines
+    ]
+    # If there are ERROR lines, return only the last one
+    error_lines = [l for l in lines if l.startswith("ERROR")]
+    if error_lines:
+        return error_lines[-1].strip()
+    return "\n".join(lines).strip()
+
+
 def _parse_device_info(yaml_path: str) -> dict:
-    """Parse basic device info from a YAML file."""
+    """Parse basic device info from a YAML file using the ESPHome CLI.
+
+    Uses `esphome config` to fully resolve includes, secrets, and custom
+    tags before parsing, avoiding failures on real-world configs that use
+    !include, !secret, !lambda, or <<: merge keys.
+
+    A permissive YAML loader is used on the CLI output to handle any
+    remaining tags (e.g. !secret values that ESPHome does not expand).
+    """
+    filename = os.path.basename(yaml_path)
     try:
-        with open(yaml_path, encoding="utf-8") as f:
-            class SecretLoader(yaml.SafeLoader):
-                pass
-
-            def secret_constructor(loader, node):
-                return f"!secret {loader.construct_scalar(node)}"
-
-            SecretLoader.add_constructor("!secret", secret_constructor)
-            data = yaml.load(f, Loader=SecretLoader)
-
-        esphome_section = data.get("esphome", {})
+        result = subprocess.run(
+            [ESPHOME_BIN, "config", yaml_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=ESPHOME_DIR,
+        )
+        if result.returncode != 0:
+            return {
+                "name": "error",
+                "friendly_name": "",
+                "file": filename,
+                "error": _clean_esphome_output(result.stderr or result.stdout),
+            }
+        # Use a permissive loader to handle any remaining tags in the output
+        data = yaml.load(result.stdout, Loader=_PermissiveLoader)
+        esphome_section = data.get("esphome", {}) if isinstance(data, dict) else {}
         return {
             "name": esphome_section.get("name", "unknown"),
             "friendly_name": esphome_section.get("friendly_name", ""),
-            "file": os.path.basename(yaml_path),
+            "file": filename,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "name": "error",
+            "friendly_name": "",
+            "file": filename,
+            "error": "timed out",
         }
     except Exception as e:
         return {
             "name": "error",
             "friendly_name": "",
-            "file": os.path.basename(yaml_path),
+            "file": filename,
             "error": str(e),
         }
 
